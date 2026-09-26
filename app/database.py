@@ -293,6 +293,44 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_maintenance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('algorithm','template','project')),
+    scope_value TEXT NOT NULL,
+    drain_at TEXT NOT NULL,
+    deadline_at TEXT NOT NULL,
+    recover_at TEXT NOT NULL,
+    deadline_policy TEXT NOT NULL DEFAULT 'cancel' CHECK(deadline_policy IN ('cancel','requeue')),
+    state TEXT NOT NULL DEFAULT 'announced' CHECK(state IN ('announced','draining','enforcing','recovered','cancelled')),
+    block_reason TEXT NOT NULL DEFAULT '',
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancelled_by TEXT NOT NULL DEFAULT '',
+    affected_task_ids_json TEXT NOT NULL DEFAULT '[]',
+    enforced_batch_key TEXT NOT NULL DEFAULT '',
+    drained_at TEXT,
+    enforced_at TEXT,
+    recovered_at TEXT,
+    recovered_by TEXT NOT NULL DEFAULT '',
+    cancelled_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_compute_maintenance_state ON compute_maintenance_windows(state,drain_at,deadline_at,recover_at);
+CREATE TABLE IF NOT EXISTS compute_maintenance_window_tasks (
+    window_id INTEGER NOT NULL REFERENCES compute_maintenance_windows(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    first_blocked_at TEXT,
+    last_blocked_at TEXT,
+    block_count INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL DEFAULT 'blocked' CHECK(outcome IN ('blocked','cancelled','requeued')),
+    resolved_at TEXT,
+    PRIMARY KEY(window_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_compute_window_tasks_task ON compute_maintenance_window_tasks(task_id);
 '''
 
 PERMISSIONS = [

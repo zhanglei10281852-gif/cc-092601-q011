@@ -88,6 +88,9 @@ class ComputeOperationsService:
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
+            blocked = repository.blocked_queued_head(capabilities, now)
+            if blocked is not None:
+                repository.record_window_block(blocked["window_id"], blocked["id"], now)
             candidate = repository.queued_candidate(capabilities, now)
             if candidate is None:
                 return None

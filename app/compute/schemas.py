@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -80,3 +81,30 @@ class BatchOperation(BaseModel):
         if self.operation == "priority" and self.priority is None:
             raise ValueError("批量调整优先级时必须提供 priority")
         return self
+
+
+class MaintenanceWindowCreate(BaseModel):
+    code: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9._-]+$")
+    name: str = Field(min_length=2, max_length=120)
+    scope_type: Literal["algorithm", "template", "project"]
+    scope_value: str = Field(min_length=1, max_length=120)
+    drain_at: datetime
+    deadline_at: datetime
+    recover_at: datetime
+    deadline_policy: Literal["cancel", "requeue"] = "cancel"
+    block_reason: str = Field(default="", max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_timeline(self) -> "MaintenanceWindowCreate":
+        if not (self.drain_at <= self.deadline_at <= self.recover_at):
+            raise ValueError("维护窗口时间需要满足 排空开始 <= 截止时间 <= 恢复时间")
+        return self
+
+
+class MaintenanceWindowCancel(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class MaintenanceClaimCheck(BaseModel):
+    capabilities: list[str] = Field(default_factory=list, max_length=100)

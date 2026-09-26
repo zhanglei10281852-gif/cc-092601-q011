@@ -2,7 +2,22 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.maintenance import MaintenanceWindowService
+from app.compute.schemas import (
+    BatchOperation,
+    CancelRequest,
+    MaintenanceClaimCheck,
+    MaintenanceWindowCancel,
+    MaintenanceWindowCreate,
+    PriorityRequest,
+    QuotaSet,
+    RetryRequest,
+    TaskClaim,
+    TaskFailure,
+    TaskResult,
+    TaskSubmit,
+    TemplateCreate,
+)
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -10,6 +25,10 @@ router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
 
 def service() -> ComputeOperationsService:
     return ComputeOperationsService()
+
+
+def maintenance_service() -> MaintenanceWindowService:
+    return MaintenanceWindowService()
 
 
 @router.get("/templates")
@@ -44,7 +63,48 @@ def get_task(task_id: int):
 
 @router.post("/tasks/claim")
 def claim_task(payload: TaskClaim):
-    return {"task": service().claim(payload.worker_id, payload.capabilities, payload.lease_seconds)}
+    operations = service()
+    task = operations.claim(payload.worker_id, payload.capabilities, payload.lease_seconds)
+    response: dict = {"task": task}
+    if task is None:
+        # 没有领到任务时，告知运营侧是否因维护窗口排空而被拦截
+        response["blocked"] = MaintenanceWindowService(operations.connection, operations.clock).claim_gate(payload.capabilities)
+    return response
+
+
+@router.post("/maintenance/claim-check")
+def maintenance_claim_check(payload: MaintenanceClaimCheck):
+    return {"blocked": maintenance_service().claim_gate(payload.capabilities)}
+
+
+@router.get("/maintenance/windows")
+def list_maintenance_windows(state: str | None = None, scope_type: str | None = None, scope_value: str | None = None):
+    return {"items": maintenance_service().list_windows(state=state, scope_type=scope_type, scope_value=scope_value)}
+
+
+@router.post("/maintenance/windows", status_code=201)
+def create_maintenance_window(payload: MaintenanceWindowCreate, actor: str = Query(..., min_length=1)):
+    return maintenance_service().create_window(payload.model_dump(), actor)
+
+
+@router.get("/maintenance/windows/{window_id}")
+def get_maintenance_window(window_id: int):
+    return maintenance_service().get_window(window_id)
+
+
+@router.post("/maintenance/windows/{window_id}/advance")
+def advance_maintenance_window(window_id: int, actor: str = Query(default="maintenance-scheduler", min_length=1)):
+    return maintenance_service().advance_window(window_id, actor)
+
+
+@router.post("/maintenance/windows/{window_id}/cancel")
+def cancel_maintenance_window(window_id: int, payload: MaintenanceWindowCancel):
+    return maintenance_service().cancel_window(window_id, payload.actor, payload.reason)
+
+
+@router.post("/maintenance/windows/{window_id}/recover")
+def recover_maintenance_window(window_id: int, payload: MaintenanceWindowCancel):
+    return maintenance_service().recover_window(window_id, payload.actor, payload.reason)
 
 
 @router.post("/tasks/{task_id}/heartbeat")
