@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -80,3 +81,18 @@ class BatchOperation(BaseModel):
         if self.operation == "priority" and self.priority is None:
             raise ValueError("批量调整优先级时必须提供 priority")
         return self
+
+
+class MaintenanceWindowCreate(BaseModel):
+    code: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9._-]+$")
+    name: str = Field(min_length=2, max_length=120)
+    scope_type: Literal["algorithm", "template", "project"]
+    scope_value: str = Field(min_length=1, max_length=120)
+    drain_policy: Literal["cancel", "requeue"] = "requeue"
+    drain_deadline: datetime
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class MaintenanceWindowAdvance(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    target: Literal["draining", "enforcing", "resumed", "cancelled"]

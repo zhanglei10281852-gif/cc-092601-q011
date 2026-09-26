@@ -293,6 +293,28 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE INDEX IF NOT EXISTS idx_compute_interventions_batch ON compute_interventions(batch_key,task_id);
+CREATE TABLE IF NOT EXISTS compute_maintenance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('algorithm','template','project')),
+    scope_value TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'announced' CHECK(status IN ('announced','draining','enforcing','resumed','cancelled')),
+    drain_policy TEXT NOT NULL CHECK(drain_policy IN ('cancel','requeue')),
+    drain_deadline TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    announced_at TEXT NOT NULL,
+    draining_at TEXT,
+    enforced_at TEXT,
+    resumed_at TEXT,
+    cancelled_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compute_windows_status ON compute_maintenance_windows(status,drain_deadline);
 '''
 
 PERMISSIONS = [

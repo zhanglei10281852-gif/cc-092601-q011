@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchOperation, CancelRequest, MaintenanceWindowAdvance, MaintenanceWindowCreate, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -85,6 +85,31 @@ def batch_operation(payload: BatchOperation):
 @router.post("/recovery/expired-leases")
 def recover_expired(actor: str = Query(default="recovery-worker", min_length=1)):
     return service().recover_expired(actor)
+
+
+@router.post("/maintenance-windows", status_code=201)
+def create_maintenance_window(payload: MaintenanceWindowCreate, actor: str = Query(..., min_length=1)):
+    return service().create_window(payload.model_dump(), actor)
+
+
+@router.get("/maintenance-windows")
+def list_maintenance_windows(status: str | None = None):
+    return {"items": service().list_windows(status=status)}
+
+
+@router.post("/maintenance-windows/process-due")
+def process_due_maintenance_windows(actor: str = Query(default="maintenance-worker", min_length=1)):
+    return service().process_due_windows(actor)
+
+
+@router.get("/maintenance-windows/{window_id}")
+def get_maintenance_window(window_id: int):
+    return service().window_detail(window_id)
+
+
+@router.post("/maintenance-windows/{window_id}/advance")
+def advance_maintenance_window(window_id: int, payload: MaintenanceWindowAdvance):
+    return service().advance_window(window_id, payload.actor, payload.target)
 
 
 @router.get("/summary")

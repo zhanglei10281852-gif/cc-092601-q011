@@ -6,7 +6,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
-from app.compute.repository import ComputeRepository
+from app.compute.repository import BLOCKING_WINDOW_STATES, ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
@@ -15,6 +15,39 @@ from app.database import get_connection, transaction
 def digest(value: Any) -> str:
     text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+WINDOW_STATUS_LABELS = {
+    "announced": "预告",
+    "draining": "排空",
+    "enforcing": "强制停止",
+    "resumed": "已恢复",
+    "cancelled": "已取消",
+}
+
+# 允许的状态推进方向；目标状态与当前状态相同时为幂等空操作。
+WINDOW_TRANSITIONS = {
+    "announced": {"draining", "enforcing", "cancelled"},
+    "draining": {"enforcing", "resumed", "cancelled"},
+    "enforcing": {"resumed"},
+    "resumed": set(),
+    "cancelled": set(),
+}
+
+# 策略严格程度：取消比重新排队更严格，窗口重叠时取数值更大者。
+WINDOW_POLICY_RANK = {"requeue": 1, "cancel": 2}
+
+# 推进到各状态时写入的时间戳列。
+WINDOW_TIMESTAMP_COLUMNS = {
+    "draining": "draining_at",
+    "enforcing": "enforced_at",
+    "resumed": "resumed_at",
+    "cancelled": "cancelled_at",
+}
+
+
+def window_batch_key(window_id: int) -> str:
+    return f"maintenance-window:{window_id}"
 
 
 class ComputeOperationsService:
@@ -80,6 +113,20 @@ class ComputeOperationsService:
         result = dict(row)
         result["results"] = self.repository.result_versions(task_id)
         result["interventions"] = self.repository.interventions(task_id)
+        result["blocking"] = None
+        if result["status"] == "queued":
+            window = self.repository.blocking_window_for_task(task_id)
+            if window is not None:
+                label = WINDOW_STATUS_LABELS[window["status"]]
+                result["blocking"] = {
+                    "window_id": window["id"],
+                    "code": window["code"],
+                    "name": window["name"],
+                    "status": window["status"],
+                    "status_label": label,
+                    "reason": window["reason"],
+                    "message": f"维护窗口 {window['code']}（{window['name']}）处于{label}阶段，匹配任务暂停新领取",
+                }
         return result
 
     def claim(self, worker_id: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:
@@ -214,6 +261,124 @@ class ComputeOperationsService:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM compute_tasks GROUP BY status ORDER BY status").fetchall()
         oldest = self.connection.execute("SELECT MIN(created_at) FROM compute_tasks WHERE status='queued'").fetchone()[0]
         return {"states": {row["status"]: row["amount"] for row in rows}, "oldest_queued_at": oldest, "templates": len(self.repository.active_templates())}
+
+    def create_window(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        deadline = to_storage(payload["drain_deadline"])
+        if deadline <= now:
+            raise ValidationError("维护窗口截止时间必须晚于当前时间")
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            if repository.window_by_code(payload["code"]):
+                raise ConflictError("维护窗口编码已存在")
+            if payload["scope_type"] == "template" and repository.template_by_code(payload["scope_value"]) is None:
+                raise NotFoundError("参数模板不存在")
+            window = repository.create_window(
+                code=payload["code"], name=payload["name"], scope_type=payload["scope_type"],
+                scope_value=payload["scope_value"], drain_policy=payload["drain_policy"],
+                drain_deadline=deadline, reason=payload["reason"], created_by=actor, now=now,
+            )
+            return self._window_view(repository, window, include_tasks=True)
+
+    def list_windows(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        return [self._window_view(self.repository, row, include_tasks=False) for row in self.repository.list_windows(status=status)]
+
+    def window_detail(self, window_id: int) -> dict[str, Any]:
+        window = self.repository.window_by_id(window_id)
+        if window is None:
+            raise NotFoundError("维护窗口不存在")
+        return self._window_view(self.repository, dict(window), include_tasks=True)
+
+    def advance_window(self, window_id: int, actor: str, target: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            window = repository.window_by_id(window_id)
+            if window is None:
+                raise NotFoundError("维护窗口不存在")
+            if window["status"] == target:
+                # 幂等推进：重复推进到当前状态不产生状态变更和二次干预记录。
+                return self._window_view(repository, dict(window), include_tasks=True)
+            self._transition_window(connection, repository, dict(window), actor, target, now)
+            return self._window_view(repository, dict(repository.window_by_id(window_id)), include_tasks=True)
+
+    def process_due_windows(self, actor: str = "maintenance-worker") -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        enforced: list[int] = []
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            for window in repository.due_draining_windows(now):
+                self._transition_window(connection, repository, dict(window), actor, "enforcing", now)
+                enforced.append(int(window["id"]))
+        return {"enforced": enforced}
+
+    def _transition_window(self, connection: sqlite3.Connection, repository: ComputeRepository, window: dict[str, Any], actor: str, target: str, now: str) -> None:
+        current = window["status"]
+        if target not in WINDOW_TRANSITIONS.get(current, set()):
+            raise ConflictError(f"维护窗口不能从{WINDOW_STATUS_LABELS[current]}推进到{WINDOW_STATUS_LABELS[target]}")
+        column = WINDOW_TIMESTAMP_COLUMNS[target]
+        cursor = connection.execute(
+            f"UPDATE compute_maintenance_windows SET status=?,{column}=?,updated_at=?,version=version+1 WHERE id=? AND status=?",
+            (target, now, now, window["id"], current),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("维护窗口状态已变化，请刷新后重试")
+        if target == "enforcing":
+            self._enforce_window(connection, repository, dict(repository.window_by_id(window["id"])), actor, now)
+
+    def _enforce_window(self, connection: sqlite3.Connection, repository: ComputeRepository, window: dict[str, Any], actor: str, now: str) -> None:
+        batch_key = window_batch_key(window["id"])
+        for task in repository.tasks_matching_window(window, ("running", "cancel_requested")):
+            if repository.intervention_exists(task["id"], batch_key):
+                continue
+            policy, stricter_sources = self._effective_policy(repository, window, task)
+            before = dict(task)
+            status = "cancelled" if policy == "cancel" else "queued"
+            message = f"维护窗口 {window['code']} 强制{'停止' if policy == 'cancel' else '重新排队'}"
+            connection.execute(
+                "UPDATE compute_tasks SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='maintenance_window',last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                (status, now, message, now if policy == "cancel" else None, now, task["id"]),
+            )
+            after = dict(repository.task_by_id(task["id"]))
+            reason = f"维护窗口 {window['code']}（{window['name']}）强制停止：{window['reason']}"
+            if stricter_sources and policy != window["drain_policy"]:
+                reason += f"；与窗口 {','.join(stricter_sources)} 重叠，采用更严格策略"
+            repository.add_intervention(task_id=task["id"], actor=actor, action=f"maintenance_{policy}", reason=reason, before=before, after=after, batch_key=batch_key, now=now)
+
+    @staticmethod
+    def _effective_policy(repository: ComputeRepository, window: dict[str, Any], task: dict[str, Any]) -> tuple[str, list[str]]:
+        overlapping = repository.enforcing_windows_matching_task(task)
+        strictest = max(WINDOW_POLICY_RANK[item["drain_policy"]] for item in overlapping)
+        policy = "cancel" if strictest >= WINDOW_POLICY_RANK["cancel"] else "requeue"
+        sources = sorted(item["code"] for item in overlapping if item["id"] != window["id"] and WINDOW_POLICY_RANK[item["drain_policy"]] == strictest)
+        return policy, sources
+
+    def _window_view(self, repository: ComputeRepository, window: dict[str, Any], *, include_tasks: bool) -> dict[str, Any]:
+        data = dict(window)
+        label = WINDOW_STATUS_LABELS[window["status"]]
+        data["status_label"] = label
+        blocking = window["status"] in BLOCKING_WINDOW_STATES
+        data["blocking"] = {
+            "active": blocking,
+            "reason": window["reason"] if blocking else "",
+            "message": f"维护窗口 {window['code']}（{window['name']}）处于{label}阶段，匹配任务暂停新领取" if blocking else "",
+        }
+        affected = repository.tasks_matching_window(window, ("queued", "running", "cancel_requested"))
+        counts = repository.intervention_counts(window_batch_key(window["id"]))
+        leased = sum(1 for task in affected if task["status"] in {"running", "cancel_requested"})
+        data["progress"] = {
+            "matched_active": len(affected),
+            "queued": sum(1 for task in affected if task["status"] == "queued"),
+            "running": sum(1 for task in affected if task["status"] == "running"),
+            "cancel_requested": sum(1 for task in affected if task["status"] == "cancel_requested"),
+            "leased": leased,
+            "drained": leased == 0,
+            "enforced_cancelled": counts.get("maintenance_cancel", 0),
+            "enforced_requeued": counts.get("maintenance_requeue", 0),
+        }
+        if include_tasks:
+            data["affected_tasks"] = affected
+        return data
 
     def _intervene(self, task_id: int, actor: str, reason: str, action: str, batch_key: str, mutation: Callable[[sqlite3.Connection, sqlite3.Row, str], None]) -> dict[str, Any]:
         now = to_storage(self.clock.now())

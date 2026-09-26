@@ -4,6 +4,22 @@ import json
 import sqlite3
 from typing import Any, Iterable
 
+# 任务与维护窗口范围匹配的关联条件，供各类查询复用。
+WINDOW_MATCH_CONDITION = (
+    "(w.scope_type='algorithm' AND w.scope_value=tpl.algorithm)"
+    " OR (w.scope_type='template' AND w.scope_value=tpl.code)"
+    " OR (w.scope_type='project' AND w.scope_value=t.project_code)"
+)
+
+# 处于这些状态的窗口会阻止匹配任务被新领取。
+BLOCKING_WINDOW_STATES = ("draining", "enforcing")
+
+_SCOPE_CLAUSES = {
+    "algorithm": "tpl.algorithm=?",
+    "template": "tpl.code=?",
+    "project": "t.project_code=?",
+}
+
 
 class ComputeRepository:
     """封装计算任务运营领域的 SQLite 读写。"""
@@ -66,8 +82,13 @@ class ComputeRepository:
             placeholders = ",".join("?" for _ in capability_list)
             condition = f" AND tpl.algorithm IN ({placeholders})"
             params.extend(capability_list)
+        blocking = ",".join("?" for _ in BLOCKING_WINDOW_STATES)
+        params.extend(BLOCKING_WINDOW_STATES)
         return self.connection.execute(
-            "SELECT t.*,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.status='queued' AND t.available_at<=?" + condition + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
+            "SELECT t.*,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.status='queued' AND t.available_at<=?"
+            + condition
+            + f" AND NOT EXISTS (SELECT 1 FROM compute_maintenance_windows w WHERE w.status IN ({blocking}) AND ({WINDOW_MATCH_CONDITION}))"
+            + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
             params,
         ).fetchone()
 
@@ -102,3 +123,59 @@ class ComputeRepository:
             values,
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def window_by_id(self, window_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_maintenance_windows WHERE id=?", (window_id,)).fetchone()
+
+    def window_by_code(self, code: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_maintenance_windows WHERE code=?", (code,)).fetchone()
+
+    def create_window(self, *, code: str, name: str, scope_type: str, scope_value: str, drain_policy: str, drain_deadline: str, reason: str, created_by: str, now: str) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            "INSERT INTO compute_maintenance_windows(code,name,scope_type,scope_value,status,drain_policy,drain_deadline,reason,created_by,announced_at,created_at,updated_at) VALUES(?,?,?,?,'announced',?,?,?,?,?,?,?)",
+            (code, name, scope_type, scope_value, drain_policy, drain_deadline, reason, created_by, now, now, now),
+        )
+        return dict(self.window_by_id(cursor.lastrowid))
+
+    def list_windows(self, *, status: str | None) -> list[dict[str, Any]]:
+        if status:
+            rows = self.connection.execute("SELECT * FROM compute_maintenance_windows WHERE status=? ORDER BY drain_deadline,id", (status,)).fetchall()
+        else:
+            rows = self.connection.execute("SELECT * FROM compute_maintenance_windows ORDER BY drain_deadline,id").fetchall()
+        return [dict(row) for row in rows]
+
+    def due_draining_windows(self, now: str) -> list[sqlite3.Row]:
+        return self.connection.execute("SELECT * FROM compute_maintenance_windows WHERE status='draining' AND drain_deadline<=? ORDER BY drain_deadline,id", (now,)).fetchall()
+
+    def tasks_matching_window(self, window: sqlite3.Row | dict[str, Any], statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in statuses)
+        params: list[Any] = list(statuses)
+        params.append(window["scope_value"])
+        rows = self.connection.execute(
+            f"SELECT t.*,tpl.code AS template_code,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.status IN ({placeholders}) AND {_SCOPE_CLAUSES[window['scope_type']]} ORDER BY t.priority DESC,t.created_at ASC,t.id ASC",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def blocking_window_for_task(self, task_id: int) -> sqlite3.Row | None:
+        blocking = ",".join("?" for _ in BLOCKING_WINDOW_STATES)
+        # 参数顺序需与 SQL 中 ? 的出现顺序一致：JOIN 先于 WHERE。
+        params: list[Any] = [task_id, *BLOCKING_WINDOW_STATES]
+        return self.connection.execute(
+            f"SELECT w.* FROM compute_maintenance_windows w JOIN compute_tasks t ON t.id=? JOIN compute_templates tpl ON tpl.id=t.template_id WHERE w.status IN ({blocking}) AND ({WINDOW_MATCH_CONDITION}) ORDER BY CASE w.status WHEN 'enforcing' THEN 0 ELSE 1 END,w.drain_deadline,w.id LIMIT 1",
+            params,
+        ).fetchone()
+
+    def enforcing_windows_matching_task(self, task: sqlite3.Row | dict[str, Any]) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM compute_maintenance_windows WHERE status='enforcing' AND ((scope_type='algorithm' AND scope_value=?) OR (scope_type='template' AND scope_value=?) OR (scope_type='project' AND scope_value=?)) ORDER BY id",
+            (task["template_algorithm"], task["template_code"], task["project_code"]),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def intervention_exists(self, task_id: int, batch_key: str) -> bool:
+        return self.connection.execute("SELECT 1 FROM compute_interventions WHERE task_id=? AND batch_key=? LIMIT 1", (task_id, batch_key)).fetchone() is not None
+
+    def intervention_counts(self, batch_key: str) -> dict[str, int]:
+        rows = self.connection.execute("SELECT action,COUNT(*) AS amount FROM compute_interventions WHERE batch_key=? GROUP BY action", (batch_key,)).fetchall()
+        return {str(row["action"]): int(row["amount"]) for row in rows}
